@@ -8,7 +8,7 @@ Automation agent that completes all 30 steps of the Brett Adcock browser navigat
 
 - **Language:** Python 3.12 (stable for Playwright)
 - **Browser automation:** Playwright (async)
-- **Optional LLM layer:** OpenAI API (fallback when deterministic logic can’t solve a step)
+- **Optional LLM layer:** Multi-provider (OpenAI or Anthropic) fallback when deterministic logic can’t solve a step
 - **Logging:** Python `logging` + optional **Rich** for console
 - **Debug artifacts:** Playwright video, optional tracing, failure screenshots, **live_status.md** (live view during run)
 
@@ -33,7 +33,7 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-**Requirements:** `playwright`, `rich` (prettier console logs). For LLM fallback: `pip install openai` and set `OPENAI_API_KEY`.
+**Requirements:** `playwright`, `rich`. For LLM fallback: `pip install openai` (and/or `anthropic` for Anthropic). Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. See **ARCHITECTURE.md** for design.
 
 ## Run
 
@@ -59,14 +59,19 @@ python main.py "https://lnkd.in/e-YBMMv7" --no-run-until-30
 
 ### LLM fallback (when deterministic fails)
 
-Set `OPENAI_API_KEY` and opt in:
+Set the API key for your chosen provider and opt in:
 
 ```bash
+# OpenAI (default)
 set OPENAI_API_KEY=sk-...
-python main.py "https://lnkd.in/e-YBMMv7" --use-llm
+python main.py --use-llm
+
+# Anthropic
+set ANTHROPIC_API_KEY=sk-ant-...
+python main.py --use-llm --llm-provider anthropic --model claude-3-5-haiku-20241022
 ```
 
-Optional: `--max-llm-calls 10` (default), `--model gpt-4o-mini`.
+Optional: `--llm-provider openai|anthropic`, `--max-llm-calls 10`, `--model <name>`.
 
 ## CLI options
 
@@ -82,9 +87,10 @@ Optional: `--max-llm-calls 10` (default), `--model gpt-4o-mini`.
 | `--max-iterations N` | Max iterations until 30 steps in <5 min (default: 30) |
 | `--run-until-30` / `--no-run-until-30` | Keep running until 30 steps in under 5 min (default: on) |
 | `--continue-on-error` | On step failure, continue to next step |
-| `--use-llm` | Use LLM fallback when deterministic extraction fails (requires `OPENAI_API_KEY`) |
+| `--use-llm` | Use LLM fallback when deterministic extraction fails |
+| `--llm-provider` | `openai` (OPENAI_API_KEY) or `anthropic` (ANTHROPIC_API_KEY) (default: openai) |
 | `--max-llm-calls N` | Max LLM calls per run (default: 10) |
-| `--model MODEL` | OpenAI model for LLM fallback (default: gpt-4o-mini) |
+| `--model MODEL` | Model for chosen provider (e.g. gpt-4o-mini, claude-3-5-haiku-20241022) |
 | `--diagnostic-screenshots` | Screenshot every second for 60s → `out/diagnostic/` |
 
 ## Outputs (under `out/` or `--out-dir`)
@@ -108,7 +114,7 @@ Optional: `--max-llm-calls 10` (default), `--model gpt-4o-mini`.
 2. **Fast path**
    - If codes are present in storage or network cache, use them to submit without DOM extraction.
 
-3. **LLM fallback** (only with `--use-llm` and `OPENAI_API_KEY`)
+3. **LLM fallback** (only with `--use-llm` and the provider’s API key set)
    - When deterministic extraction fails, the agent sends the model: URL, visible buttons/inputs, body snippet (~2k chars), current step.
    - Model returns a small JSON action plan: `click`, `type`, `press`, `scroll`.
    - Actions are validated and executed with Playwright; then deterministic extraction is retried.

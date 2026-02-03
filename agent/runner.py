@@ -1,6 +1,7 @@
 """Core loop across 30 steps: normalize UI, extract code (storage/network/DOM), submit, progress."""
 import asyncio
 import logging
+import random
 import re
 import sys
 import time
@@ -8,6 +9,12 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+
+def _retry_backoff_ms(attempt: int, base_ms: int = 60, max_ms: int = 500) -> int:
+    """Exponential backoff with jitter to avoid thundering herd (research-backed)."""
+    cap = min(max_ms, base_ms * (2 ** attempt))
+    return int(cap) + random.randint(0, max(20, base_ms // 2))
 
 from playwright.async_api import Page, async_playwright
 
@@ -85,6 +92,25 @@ async def get_current_step(page: Page) -> Optional[int]:
         return int(step) if step is not None and 1 <= step <= 30 else None
     except Exception:
         return None
+
+
+async def _wait_for_step_advance(page: Page, min_step: int, timeout_ms: int) -> bool:
+    """State-based verification: wait until page shows Step N of 30 with N >= min_step (event-driven, fast)."""
+    try:
+        await page.wait_for_function(
+            """([minStep]) => {
+                const body = document.body?.innerText || '';
+                const m = body.match(/Step\\s+(\\d+)\\s+of\\s+30/i);
+                if (!m) return false;
+                const step = parseInt(m[1], 10);
+                return step >= minStep && step <= 30;
+            }""",
+            timeout=timeout_ms,
+            arg=min_step,
+        )
+        return True
+    except Exception:
+        return False
 
 
 async def try_click_start(page: Page, log_debug: Optional[Callable[..., None]] = None) -> None:
@@ -167,6 +193,7 @@ async def run_step(
     use_fast_path: bool,
     learned_method: Optional[str] = None,
     network_cache: Optional[dict[int, str]] = None,
+    fast_mode: bool = False,
 ) -> tuple[bool, float, str, str, Optional[str]]:
     """
     Run one step: get code (parallel extraction, then pick by learned preference), fill and submit.
@@ -180,17 +207,21 @@ async def run_step(
 
     # 1) Close promotional popups first so Select Option modal is reachable
     await normalize_ui(page, rounds=2 if step == 1 else 1)
-    await page.wait_for_timeout(40 if step == 1 else 25)
+    await page.wait_for_timeout((20 if fast_mode else 40) if step == 1 else (15 if fast_mode else 25))
 
     # 2) Handle "Please Select an Option" modal (scroll, pick correct option, Submit inside modal only)
     await handle_select_option_modal(page)
-    await page.wait_for_timeout(25)
+    await page.wait_for_timeout(15 if fast_mode else 25)
 
     # 3) Dismiss "Wrong Button!" if it appeared, then retry modal submit if still open
     await normalize_ui(page, rounds=1)
-    await page.wait_for_timeout(25)
+    await page.wait_for_timeout(15 if fast_mode else 25)
     await handle_select_option_modal(page)
-    await page.wait_for_timeout(25)
+    await page.wait_for_timeout(15 if fast_mode else 25)
+    # Steps 4-5: multiple nested popups (newsletter, Important Note, Select Option) – be more aggressive
+    popup_rounds = 3 if step in (4, 5) else (2 if step == 1 else 1)
+    await normalize_ui(page, rounds=popup_rounds)
+    await page.wait_for_timeout(50 if step in (4, 5) else ((20 if fast_mode else 40) if step == 1 else (15 if fast_mode else 25)))
 
     # 4) Parallel extraction: storage (async), network (sync from cache), DOM (async)
     # Skip normalize in _try_dom since we already did popup handling above
@@ -229,9 +260,13 @@ async def run_step(
     # 4b) Retry extraction if no code found - code may appear after modal interactions
     if not code:
         log_debug("Step %d: first extraction found no valid code, retrying after additional popup handling", step)
-        # Additional cleanup: ensure all popups are closed
-        await normalize_ui(page, rounds=2)
-        await page.wait_for_timeout(50)
+        # Additional cleanup: ensure all popups are closed (steps 4-5: more rounds)
+        popup_retry_rounds = 3 if step in (4, 5) else 2
+        await normalize_ui(page, rounds=popup_retry_rounds)
+        await page.wait_for_timeout(50 if step in (4, 5) else 50)
+        if step in (4, 5):
+            await handle_select_option_modal(page)
+            await page.wait_for_timeout(40)
         # Re-check localStorage directly for this step's key (may have been set by modal submit)
         direct_storage_code = await get_challenge_code_for_step_from_storage(page, step)
         if direct_storage_code and is_valid_step_code(direct_storage_code):
@@ -252,6 +287,15 @@ async def run_step(
                     code = retry_dom[0]
                     method = retry_dom[1]
                     log_debug("Step %d: retry found code in DOM", step)
+                # Steps 4-5: final attempt – scroll page and extract (code may appear after scroll)
+                elif not code and step in (4, 5):
+                    await scroll_to_bottom_and_back(page)
+                    await page.wait_for_timeout(80)
+                    final_code = await extract_codes_from_dom(page)
+                    if final_code and is_valid_step_code(final_code):
+                        code = final_code
+                        method = "dom"
+                        log_debug("Step %d: final scroll+extract found code", step)
 
     if not code:
         elapsed = time.perf_counter() - start
@@ -259,18 +303,19 @@ async def run_step(
     code_used = code
 
     # 5) Select correct option if step requires it (e.g. radio "Option B - Correct Choice")
+    opt_wait = 30 if fast_mode else 50
     try:
         correct = page.locator('input[type="radio"]').filter(has_text="Correct").first
         if await correct.count() > 0:
             await correct.click(timeout=2000)
-            await page.wait_for_timeout(50)
+            await page.wait_for_timeout(opt_wait)
     except Exception:
         pass
     try:
         correct = page.locator('label:has-text("Correct"), input[value*="correct" i]').first
         if await correct.count() > 0:
             await correct.click(timeout=2000)
-            await page.wait_for_timeout(50)
+            await page.wait_for_timeout(opt_wait)
     except Exception:
         pass
 
@@ -292,6 +337,7 @@ async def solve_one_step(
     context: Optional[Any] = None,
     learned_method: Optional[str] = None,
     network_cache: Optional[dict[int, str]] = None,
+    fast_mode: bool = False,
 ) -> tuple[bool, float, str, str, Optional[str]]:
     """
     Solve one step with retries. Returns (ok, seconds, method, notes, code_used).
@@ -308,7 +354,7 @@ async def solve_one_step(
             if context is not None:
                 await close_popup_windows(context, page)
         ok, elapsed, method, notes, code_used = await run_step(
-            page, step, storage_codes, use_fast_path, learned_method=learned_method, network_cache=cache
+            page, step, storage_codes, use_fast_path, learned_method=learned_method, network_cache=cache, fast_mode=fast_mode
         )
         if code_used is not None:
             last_code = code_used
@@ -318,7 +364,7 @@ async def solve_one_step(
         )
         if ok:
             return True, elapsed, method, notes, code_used
-        await page.wait_for_timeout(200)
+        await page.wait_for_timeout(_retry_backoff_ms(attempt))
     return False, time.perf_counter() - step_start, method, notes, last_code
 
 
@@ -366,6 +412,7 @@ async def run_challenge(
     use_llm: bool = False,
     max_llm_calls: int = 10,
     llm_model: str = "gpt-4o-mini",
+    llm_provider: str = "openai",
     openai_api_key: Optional[str] = None,
     live_status_path: Optional[Path] = None,
     iteration: Optional[int] = None,
@@ -379,10 +426,11 @@ async def run_challenge(
     (out_dir / "traces").mkdir(parents=True, exist_ok=True)
 
     fast_mode = timeout_minutes <= 5
-    # ~2x speed: shorter waits so we can finish 30 steps in under 5 min
-    post_submit_wait_ms = 100 if fast_mode else 300
-    advance_poll_count = 20 if fast_mode else 50
-    advance_poll_ms = 50 if fast_mode else 150
+    # Turbo fast mode: event-driven step advance + minimal fixed waits (research: avoid waitForTimeout, use state)
+    post_submit_wait_ms = 50 if fast_mode else 200
+    advance_poll_count = 25 if fast_mode else 40
+    advance_poll_ms = 35 if fast_mode else 120
+    advance_wait_for_function_ms = 2500 if fast_mode else 4500  # state-based: proceed as soon as DOM updates
 
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     step_results: list[StepResult] = []
@@ -433,11 +481,11 @@ async def run_challenge(
         try:
             log_debug("Navigating to %s", url)
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(600 if fast_mode else 1200)
+            await page.wait_for_timeout(300 if fast_mode else 800)
 
             # Clear Cookie Consent and other overlays first (they block all clicks)
             await normalize_ui(page, rounds=2)
-            await page.wait_for_timeout(100 if fast_mode else 200)
+            await page.wait_for_timeout(50 if fast_mode else 150)
 
             # Initial START if on landing
             current_after_load = await get_current_step(page)
@@ -517,6 +565,7 @@ async def run_challenge(
                     page, expected_step, storage_codes, use_fast_path, max_retries_per_step, context,
                     learned_method=learned.get(expected_step),
                     network_cache=network_cache,
+                    fast_mode=fast_mode,
                 )
 
                 # Optional LLM fallback when deterministic failed and we have budget
@@ -524,12 +573,12 @@ async def run_challenge(
                     try:
                         from .llm_fallback import get_page_context, ask_llm_for_plan, execute_action_plan, estimate_cost_usd
                         context_dict = await get_page_context(page, step=expected_step)
-                        plan, usage = await ask_llm_for_plan(context_dict, llm_model, openai_api_key)
+                        plan, usage = await ask_llm_for_plan(context_dict, llm_model, openai_api_key, provider=llm_provider)
                         if usage:
                             token_usage_accum["prompt_tokens"] = token_usage_accum.get("prompt_tokens", 0) + usage.get("prompt_tokens", 0)
                             token_usage_accum["completion_tokens"] = token_usage_accum.get("completion_tokens", 0) + usage.get("completion_tokens", 0)
                             token_usage_accum["total_tokens"] = token_usage_accum.get("total_tokens", 0) + usage.get("total_tokens", 0)
-                            token_cost_usd_accum += estimate_cost_usd(llm_model, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+                            token_cost_usd_accum += estimate_cost_usd(llm_model, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), provider=llm_provider)
                         if plan:
                             llm_calls_used += 1
                             await execute_action_plan(page, plan)
@@ -538,6 +587,7 @@ async def run_challenge(
                                 page, expected_step, storage_codes, use_fast_path, max_retries_per_step, context,
                                 learned_method=learned.get(expected_step),
                                 network_cache=network_cache,
+                                fast_mode=fast_mode,
                             )
                             if ok:
                                 method = "llm"
@@ -569,17 +619,24 @@ async def run_challenge(
                         continue
                     break
 
-                # ---- After submit, only advance when we have positive UI confirmation ----
+                # ---- After submit: state-based verification (event-driven) then fallback poll ----
                 solved_step = expected_step  # step we just submitted
                 await page.wait_for_timeout(post_submit_wait_ms)
                 advanced = False
-                for poll in range(advance_poll_count):
-                    await page.wait_for_timeout(advance_poll_ms)
+                # Event-driven: wait until DOM shows step >= expected+1 (proceed as soon as ready)
+                if await _wait_for_step_advance(page, expected_step + 1, advance_wait_for_function_ms):
                     s = await get_current_step(page)
                     if s is not None and s >= expected_step + 1:
                         expected_step = s
                         advanced = True
-                        break
+                if not advanced:
+                    for poll in range(advance_poll_count):
+                        await page.wait_for_timeout(advance_poll_ms)
+                        s = await get_current_step(page)
+                        if s is not None and s >= expected_step + 1:
+                            expected_step = s
+                            advanced = True
+                            break
                 if advanced:
                     solved += 1
                     step_results.append(StepResult(
@@ -592,18 +649,28 @@ async def run_challenge(
                     s_final = await get_current_step(page)
                     # Page still on same step = submit did not advance (wrong code or wrong button)
                     if s_final == solved_step:
-                        # Steps 1–5: retry once (reveal + extract + submit again) before failing
-                        if solved_step in (1, 2, 3, 4, 5):
-                            log_debug("Step %d: submit did not advance; retrying step %d once", solved_step, solved_step)
-                            await page.wait_for_timeout(250)
-                            ok_retry, elapsed_retry, method_retry, notes_retry, code_retry = await solve_one_step(
-                                page, solved_step, storage_codes, use_fast_path, max_retries_per_step, context,
-                                learned_method=learned.get(solved_step),
-                                network_cache=network_cache,
-                            )
-                            retry_advanced = False
-                            if ok_retry:
-                                await page.wait_for_timeout(post_submit_wait_ms)
+                        # All steps: retry once with backoff (research: retry with jitter avoids thundering herd)
+                        log_debug("Step %d: submit did not advance; retrying step %d once (with backoff)", solved_step, solved_step)
+                        await page.wait_for_timeout(_retry_backoff_ms(0))
+                        ok_retry, elapsed_retry, method_retry, notes_retry, code_retry = await solve_one_step(
+                            page, solved_step, storage_codes, use_fast_path, max_retries_per_step, context,
+                            learned_method=learned.get(solved_step),
+                            network_cache=network_cache,
+                            fast_mode=fast_mode,
+                        )
+                        retry_advanced = False
+                        if ok_retry:
+                            await page.wait_for_timeout(post_submit_wait_ms)
+                            if await _wait_for_step_advance(page, solved_step + 1, advance_wait_for_function_ms):
+                                s = await get_current_step(page)
+                                if s is not None and s >= solved_step + 1:
+                                    expected_step = s
+                                    solved += 1
+                                    step_results.append(StepResult(step=solved_step, ok=True, seconds=elapsed_retry, method=method_retry, notes=notes_retry, code_redacted=redact_code(code_retry) if code_retry else None))
+                                    if live_status_path is not None and iteration is not None:
+                                        _write_live_status(live_status_path, iteration, solved)
+                                    retry_advanced = True
+                            if not retry_advanced:
                                 for _ in range(advance_poll_count):
                                     await page.wait_for_timeout(advance_poll_ms)
                                     s = await get_current_step(page)

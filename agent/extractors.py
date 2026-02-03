@@ -30,7 +30,9 @@ DECOY_WORDS = re.compile(
     r"Dismiss|Accept|Cookie|Consent|Privacy|Terms|Policy|"
     r"Welcome|Hello|Thanks|Thank|Please|Sorry|Error|Warning|Success|"
     r"Download|Upload|Share|Follow|Like|Comment|Social|Email|"
-    r"Already|member|account|login|signup|register|password|username)$",
+    r"Already|member|account|login|signup|register|password|username|"
+    r"Escape|escape|keyboard|press|key|"
+    r"understand|Understand|Continue|continue|accept|Accept)$",
     re.I,
 )
 

@@ -33,18 +33,21 @@ def main() -> int:
     parser.add_argument("--run-until-30", action="store_true", default=True, help="Keep running until 30 steps in under 5 min (default: on)")
     parser.add_argument("--no-run-until-30", action="store_false", dest="run_until_30", help="Single run only, no loop until 30")
     # LLM fallback (opt-in; requires OPENAI_API_KEY)
-    parser.add_argument("--use-llm", action="store_true", help="Use LLM fallback when deterministic extraction fails (requires OPENAI_API_KEY)")
+    parser.add_argument("--use-llm", action="store_true", help="Use LLM fallback when deterministic extraction fails")
+    parser.add_argument("--llm-provider", type=str, default="openai", choices=["openai", "anthropic"], help="LLM provider: openai (OPENAI_API_KEY) or anthropic (ANTHROPIC_API_KEY) (default: openai)")
     parser.add_argument("--max-llm-calls", type=int, default=10, metavar="N", help="Max LLM calls per run (default: 10)")
-    parser.add_argument("--model", type=str, default="gpt-4o-mini", metavar="MODEL", help="OpenAI model for LLM fallback (default: gpt-4o-mini)")
+    parser.add_argument("--model", type=str, default="gpt-4o-mini", metavar="MODEL", help="Model name for chosen provider (e.g. gpt-4o-mini, claude-3-5-haiku-20241022)")
     args = parser.parse_args()
 
     url = args.url.strip()
     if not url:
         url = "https://serene-frangipane-7fd25b.netlify.app/"
 
-    openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip() if os.environ.get("OPENAI_API_KEY") else ""
-    if args.use_llm and not openai_api_key:
-        print("Warning: --use-llm set but OPENAI_API_KEY not set; LLM fallback disabled.", file=sys.stderr)
+    # Resolve API key for chosen LLM provider
+    from agent.llm_providers import get_api_key_for_provider
+    llm_api_key = get_api_key_for_provider(args.llm_provider) if args.use_llm else ""
+    if args.use_llm and not llm_api_key:
+        print(f"Warning: --use-llm set but {args.llm_provider.upper()}_API_KEY not set; LLM fallback disabled.", file=sys.stderr)
         args.use_llm = False
 
     # Per-run folder: each invocation writes to out/run_<timestamp>/ so iterations don't overwrite previous runs
@@ -97,7 +100,8 @@ def main() -> int:
                         use_llm=args.use_llm,
                         max_llm_calls=args.max_llm_calls,
                         llm_model=args.model,
-                        openai_api_key=openai_api_key if args.use_llm else None,
+                        llm_provider=args.llm_provider,
+                        openai_api_key=llm_api_key if args.use_llm else None,
                         live_status_path=live_status_path,
                         iteration=iteration,
                         shared_learned_dir=args.out_dir,

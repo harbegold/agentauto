@@ -148,42 +148,24 @@ async def execute_action_plan(page: Page, plan: list[dict[str, Any]]) -> None:
             pass
 
 
-def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    """Rough cost in USD (gpt-4o-mini: $0.15/1M in, $0.60/1M out; gpt-4o: higher)."""
-    if "gpt-4o-mini" in model.lower():
-        return (prompt_tokens / 1e6) * 0.15 + (completion_tokens / 1e6) * 0.60
-    if "gpt-4o" in model.lower():
-        return (prompt_tokens / 1e6) * 2.50 + (completion_tokens / 1e6) * 10.00
-    return (prompt_tokens / 1e6) * 0.15 + (completion_tokens / 1e6) * 0.60
+def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int, provider: str = "openai") -> float:
+    """Rough cost in USD; delegates to llm_providers for multi-provider support."""
+    from .llm_providers import estimate_cost_usd as _estimate
+    return _estimate(provider, model, prompt_tokens, completion_tokens)
 
 
 async def ask_llm_for_plan(
-    context: dict[str, Any], model: str, api_key: str
+    context: dict[str, Any],
+    model: str,
+    api_key: Optional[str] = None,
+    provider: str = "openai",
 ) -> tuple[list[dict[str, Any]], Optional[dict[str, Any]]]:
-    """Call OpenAI API and return (parsed action plan, usage dict). Usage has prompt_tokens, completion_tokens, total_tokens."""
-    try:
-        import openai
-    except ImportError:
+    """Call LLM (OpenAI or Anthropic) and return (parsed action plan, usage dict)."""
+    from .llm_providers import call_llm, get_api_key_for_provider
+    key = (api_key or "").strip() or get_api_key_for_provider(provider)
+    if not key:
         return [], None
-    client = openai.AsyncOpenAI(api_key=api_key)
     prompt = build_llm_prompt(context)
-    try:
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-            temperature=0.2,
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-        plan = parse_action_plan(raw)
-        usage = None
-        if getattr(resp, "usage", None):
-            u = resp.usage
-            usage = {
-                "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(u, "total_tokens", 0) or 0,
-            }
-        return plan, usage
-    except Exception:
-        return [], None
+    raw, usage = await call_llm(provider, model, key, prompt, max_tokens=500)
+    plan = parse_action_plan(raw)
+    return plan, usage

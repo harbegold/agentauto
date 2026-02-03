@@ -156,16 +156,30 @@ async def _close_topmost_foreground_popup(page: Page) -> bool:
             # Do NOT close the "Please Select an Option" modal – handle_select_option_modal handles it
             if "select an option" in dialog_text_lower or "select your choice" in dialog_text_lower:
                 continue
-            # Check if this popup says the close button is fake – then only use Dismiss
-            fake_close = "fake" in dialog_text_lower and ("another way" in dialog_text_lower or "close" in dialog_text_lower)
+            # Check if this popup says the close button is fake – then only use Dismiss (or "Important Note" style)
+            fake_close = (
+                ("fake" in dialog_text_lower and ("another way" in dialog_text_lower or "close" in dialog_text_lower))
+                or ("important" in dialog_text_lower and "note" in dialog_text_lower)
+                or ("popup" in dialog_text_lower and "message" in dialog_text_lower and "close" in dialog_text_lower)
+            )
             if fake_close:
-                # Only click Dismiss / Got it / OK – never X or "Close"
-                for safe_text in ["Dismiss", "Got it", "OK", "I understand"]:
+                # Only click Dismiss / Got it / OK / Continue – never X or "Close"
+                for safe_text in ["Dismiss", "Got it", "OK", "I understand", "Continue"]:
                     btn = topmost.get_by_role("button", name=re.compile(re.escape(safe_text), re.I)).first
                     if await btn.count() > 0:
                         await btn.click(timeout=1000)
                         await page.wait_for_timeout(80)
                         return True
+                # Fallback: any button whose text looks like safe dismiss
+                for safe in ["Dismiss", "Got it", "OK", "I understand", "Continue"]:
+                    try:
+                        b = topmost.get_by_text(re.compile(re.escape(safe), re.I)).first
+                        if await b.count() > 0:
+                            await b.click(timeout=1000)
+                            await page.wait_for_timeout(80)
+                            return True
+                    except Exception:
+                        pass
                 continue
             # Normal popup: try Close, Dismiss, then X
             for close_text in ["Close", "Dismiss", "×", "✕", "X"]:

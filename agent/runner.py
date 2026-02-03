@@ -179,18 +179,28 @@ async def run_step(
     code_used: Optional[str] = None
 
     # 1) Close promotional popups first so Select Option modal is reachable
-    await normalize_ui(page, rounds=2 if step == 1 else 1)
-    await page.wait_for_timeout(40 if step == 1 else 25)
+    # Steps 4-5 have multiple nested popups (newsletter, Important Note, Select Option) - be more aggressive
+    popup_rounds = 3 if step in (4, 5) else (2 if step == 1 else 1)
+    await normalize_ui(page, rounds=popup_rounds)
+    await page.wait_for_timeout(50 if step in (4, 5) else (40 if step == 1 else 25))
 
     # 2) Handle "Please Select an Option" modal (scroll, pick correct option, Submit inside modal only)
     await handle_select_option_modal(page)
     await page.wait_for_timeout(25)
 
     # 3) Dismiss "Wrong Button!" if it appeared, then retry modal submit if still open
-    await normalize_ui(page, rounds=1)
+    await normalize_ui(page, rounds=2 if step in (4, 5) else 1)
     await page.wait_for_timeout(25)
     await handle_select_option_modal(page)
     await page.wait_for_timeout(25)
+
+    # 3b) For steps 4-5: extra popup clearing - these steps have multiple layered popups
+    if step in (4, 5):
+        await normalize_ui(page, rounds=2)
+        await page.wait_for_timeout(30)
+        # Try the select modal one more time in case it was hidden behind other popups
+        await handle_select_option_modal(page)
+        await page.wait_for_timeout(30)
 
     # 4) Parallel extraction: storage (async), network (sync from cache), DOM (async)
     # Skip normalize in _try_dom since we already did popup handling above
@@ -230,8 +240,18 @@ async def run_step(
     if not code:
         log_debug("Step %d: first extraction found no valid code, retrying after additional popup handling", step)
         # Additional cleanup: ensure all popups are closed
-        await normalize_ui(page, rounds=2)
+        # Steps 4-5 need extra aggressive popup clearing
+        retry_rounds = 3 if step in (4, 5) else 2
+        await normalize_ui(page, rounds=retry_rounds)
         await page.wait_for_timeout(50)
+
+        # For steps 4-5: try handling the select modal again - the code might only appear after
+        if step in (4, 5):
+            await handle_select_option_modal(page)
+            await page.wait_for_timeout(30)
+            await normalize_ui(page, rounds=2)
+            await page.wait_for_timeout(30)
+
         # Re-check localStorage directly for this step's key (may have been set by modal submit)
         direct_storage_code = await get_challenge_code_for_step_from_storage(page, step)
         if direct_storage_code and is_valid_step_code(direct_storage_code):
@@ -252,6 +272,16 @@ async def run_step(
                     code = retry_dom[0]
                     method = retry_dom[1]
                     log_debug("Step %d: retry found code in DOM", step)
+                elif step in (4, 5):
+                    # Steps 4-5: final attempt - scroll page and extract again
+                    log_debug("Step %d: final extraction attempt after scroll", step)
+                    await scroll_to_bottom_and_back(page)
+                    await page.wait_for_timeout(100)
+                    final_code = await extract_codes_from_dom(page)
+                    if final_code and is_valid_step_code(final_code):
+                        code = final_code
+                        method = "dom"
+                        log_debug("Step %d: final attempt found code in DOM", step)
 
     if not code:
         elapsed = time.perf_counter() - start

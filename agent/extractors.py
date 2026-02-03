@@ -30,7 +30,11 @@ DECOY_WORDS = re.compile(
     r"Dismiss|Accept|Cookie|Consent|Privacy|Terms|Policy|"
     r"Welcome|Hello|Thanks|Thank|Please|Sorry|Error|Warning|Success|"
     r"Download|Upload|Share|Follow|Like|Comment|Social|Email|"
-    r"Already|member|account|login|signup|register|password|username)$",
+    r"Already|member|account|login|signup|register|password|username|"
+    # Step 5 specific - "Important Note" popup text fragments
+    r"Scroll|scrolling|scroll|button|Button|close|Close|"
+    r"understand|Understand|waiting|Waiting|looking|Looking|"
+    r"Continue|continue|Dismiss|dismiss|accept|Accept)$",
     re.I,
 )
 

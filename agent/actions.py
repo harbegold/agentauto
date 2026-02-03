@@ -157,15 +157,30 @@ async def _close_topmost_foreground_popup(page: Page) -> bool:
             if "select an option" in dialog_text_lower or "select your choice" in dialog_text_lower:
                 continue
             # Check if this popup says the close button is fake – then only use Dismiss
-            fake_close = "fake" in dialog_text_lower and ("another way" in dialog_text_lower or "close" in dialog_text_lower)
+            # Also check for "Important Note" which typically has fake close button
+            fake_close = (
+                ("fake" in dialog_text_lower and ("another way" in dialog_text_lower or "close" in dialog_text_lower)) or
+                ("important" in dialog_text_lower and "note" in dialog_text_lower) or
+                ("popup" in dialog_text_lower and "message" in dialog_text_lower and "close" in dialog_text_lower)
+            )
             if fake_close:
                 # Only click Dismiss / Got it / OK – never X or "Close"
-                for safe_text in ["Dismiss", "Got it", "OK", "I understand"]:
+                for safe_text in ["Dismiss", "Got it", "OK", "I understand", "Continue"]:
                     btn = topmost.get_by_role("button", name=re.compile(re.escape(safe_text), re.I)).first
                     if await btn.count() > 0:
                         await btn.click(timeout=1000)
                         await page.wait_for_timeout(80)
                         return True
+                # Fallback: look for any button that's NOT Close/X
+                for btn_text in ["Dismiss", "Got it", "OK", "Continue", "I understand"]:
+                    btn = topmost.locator(f"button:has-text('{btn_text}')").first
+                    if await btn.count() > 0:
+                        try:
+                            await btn.click(timeout=1000)
+                            await page.wait_for_timeout(80)
+                            return True
+                        except Exception:
+                            pass
                 continue
             # Normal popup: try Close, Dismiss, then X
             for close_text in ["Close", "Dismiss", "×", "✕", "X"]:

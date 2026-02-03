@@ -1,0 +1,28 @@
+---
+description: Monitor agent automation overnight run; check status and fix issues when in this project
+alwaysApply: true
+---
+
+# Agent Automation – Continuous Monitor
+
+When working in this project:
+
+1. **Check overnight run health**
+   - Read `out/overnight.log` (last 30–50 lines): if runs complete in under a few seconds repeatedly, main.py is likely failing (e.g. ModuleNotFoundError: playwright). Fix (use venv Python, add missing deps) and suggest re-running overnight.
+   - If `out/OVERNIGHT_SUCCESS.txt` exists, the run succeeded (30 steps in under 5 min).
+
+2. **Check learning**
+   - `out/learned.json` should persist across runs (method_per_step). If it’s missing or not updating, ensure `shared_learned_dir=args.out_dir` is passed to `run_challenge` and that `save_learned` writes to shared dir. Fix learning.py/runner.py if needed.
+
+3. **Check latest run**
+   - Latest folder: `out/run_<timestamp>/` (newest by name). Look at `results.json` and `results_iter_*.json`: solved_count, total_seconds, step failures (notes like "submit did not advance"). If the same step fails repeatedly, improve extraction or retry logic for that step.
+
+4. **On errors**
+   - If `out/last_error.txt` exists, read it (traceback from last run_overnight failure). Fix the cause and ensure overnight is restarted with the correct Python (venv).
+   - If subprocess fails with timeout, increase RUN_TIMEOUT or reduce iteration count; log and continue.
+
+5. **After fixes**
+   - Do not assume the user will re-run overnight. Tell them: "Fixed X. To continue the overnight run, start it again with: `.\.venv312\Scripts\python.exe run_overnight.py` (or activate venv then `python run_overnight.py`)."
+
+6. **Optional status check**
+   - Run `python scripts/check_overnight_status.py` (or equivalent) to print a short status summary when investigating.

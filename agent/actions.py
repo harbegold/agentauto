@@ -81,6 +81,49 @@ async def _close_wrong_button_banner(page: Page) -> bool:
     return False
 
 
+async def _close_newsletter_popup(page: Page) -> bool:
+    """Close 'Subscribe to our newsletter' or similar promotional popups. Returns True if closed."""
+    try:
+        # Find popups containing newsletter/subscribe text
+        patterns = [
+            r"subscribe.*newsletter",
+            r"newsletter.*subscribe",
+            r"sign up.*newsletter",
+            r"join.*mailing",
+            r"get.*updates",
+            r"stay.*informed",
+        ]
+        for pattern in patterns:
+            container = page.locator(
+                "div, [role=dialog], [class*='modal'], [class*='popup'], [class*='overlay']"
+            ).filter(has_text=re.compile(pattern, re.I)).first
+            if await container.count() == 0:
+                continue
+            # Try common close buttons
+            for btn_text in ["No thanks", "No, thanks", "Not now", "Maybe later", "Close", "×", "✕", "X", "Dismiss", "Skip"]:
+                btn = container.get_by_role("button", name=re.compile(re.escape(btn_text), re.I)).first
+                if await btn.count() > 0:
+                    try:
+                        await btn.click(timeout=1000)
+                        await page.wait_for_timeout(80)
+                        return True
+                    except Exception:
+                        pass
+            # Fallback: any button that looks like decline/close
+            for sel in ["button", ".close", "[class*='close']"]:
+                el = container.locator(sel).first
+                if await el.count() > 0:
+                    try:
+                        await el.click(timeout=1000)
+                        await page.wait_for_timeout(80)
+                        return True
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return False
+
+
 async def _close_topmost_foreground_popup(page: Page) -> bool:
     """
     Find the topmost dialog/modal and click the right close action.
@@ -91,6 +134,9 @@ async def _close_topmost_foreground_popup(page: Page) -> bool:
     """
     # Cookie Consent overlay often has z-[9999] and intercepts all clicks – close it first by clicking inside it
     if await _close_cookie_consent(page):
+        return True
+    # Close newsletter/promotional popups
+    if await _close_newsletter_popup(page):
         return True
     # Dismiss "Wrong Button! Try Again!" so we can retry selection
     if await _close_wrong_button_banner(page):

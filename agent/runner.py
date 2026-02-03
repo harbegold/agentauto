@@ -22,6 +22,7 @@ from .actions import (
 )
 from .extractors import (
     extract_code_from_input_value,
+    extract_code_from_code_section,
     extract_codes_from_dom,
     extract_codes_from_storage,
     get_challenge_code_for_step_from_storage,
@@ -143,15 +144,18 @@ def _try_network_sync(step: int, network_cache: dict[int, str]) -> tuple[Optiona
     return None, "network"
 
 
-async def _try_dom(page: Page, step: int) -> tuple[Optional[str], str]:
+async def _try_dom(page: Page, step: int, skip_normalize: bool = False) -> tuple[Optional[str], str]:
     """Try DOM extraction (input value then reveal + body); returns (code, method) or (None, 'dom')."""
     code = await extract_code_from_input_value(page)
     if code and is_valid_step_code(code):
         return code, "dom"
     await scroll_to_bottom_and_back(page)
-    await normalize_ui(page)
+    # Only normalize if not already done by caller (avoid interference during parallel extraction)
+    if not skip_normalize:
+        await normalize_ui(page)
     code = await extract_codes_from_dom(page)
-    if code:
+    # Defense-in-depth: verify DOM-extracted code passes decoy filter
+    if code and is_valid_step_code(code):
         return code, "dom"
     return None, "dom"
 
@@ -189,8 +193,9 @@ async def run_step(
     await page.wait_for_timeout(25)
 
     # 4) Parallel extraction: storage (async), network (sync from cache), DOM (async)
+    # Skip normalize in _try_dom since we already did popup handling above
     storage_future = asyncio.create_task(_try_storage(page, step, storage_codes, use_fast_path))
-    dom_future = asyncio.create_task(_try_dom(page, step))
+    dom_future = asyncio.create_task(_try_dom(page, step, skip_normalize=True))
     storage_result = await storage_future
     dom_result = await dom_future
     network_result = _try_network_sync(step, cache)
@@ -220,6 +225,33 @@ async def run_step(
             if result[0] and is_valid_step_code(result[0]):
                 code, method = result[0], result[1]
                 break
+
+    # 4b) Retry extraction if no code found - code may appear after modal interactions
+    if not code:
+        log_debug("Step %d: first extraction found no valid code, retrying after additional popup handling", step)
+        # Additional cleanup: ensure all popups are closed
+        await normalize_ui(page, rounds=2)
+        await page.wait_for_timeout(50)
+        # Re-check localStorage directly for this step's key (may have been set by modal submit)
+        direct_storage_code = await get_challenge_code_for_step_from_storage(page, step)
+        if direct_storage_code and is_valid_step_code(direct_storage_code):
+            code = direct_storage_code
+            method = "localStorage"
+            log_debug("Step %d: retry found code in localStorage", step)
+        else:
+            # Try the code-entry section specifically
+            code_section_code = await extract_code_from_code_section(page)
+            if code_section_code and is_valid_step_code(code_section_code):
+                code = code_section_code
+                method = "dom"
+                log_debug("Step %d: retry found code in code-entry section", step)
+            else:
+                # Re-try DOM extraction with full normalization
+                retry_dom = await _try_dom(page, step, skip_normalize=False)
+                if retry_dom[0] and is_valid_step_code(retry_dom[0]):
+                    code = retry_dom[0]
+                    method = retry_dom[1]
+                    log_debug("Step %d: retry found code in DOM", step)
 
     if not code:
         elapsed = time.perf_counter() - start

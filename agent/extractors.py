@@ -23,7 +23,14 @@ DECOY_WORDS = re.compile(
     r"Choice|Pick|Option|Select|Your|This|That|The|And|For|With|From|Have|Will|Would|"
     r"Scroll|appeared|revealed|clicked|loaded|failed|passed|button|submit|before|after|"
     r"inside|outside|within|without|below|above|between|during|before|number|string|"
-    r"source|target|window|screen|element|parent|child|sibling|length|height|width)$",
+    r"source|target|window|screen|element|parent|child|sibling|length|height|width|"
+    # Additional words from popup/modal text that should never be codes
+    r"Subscribe|newsletter|Important|message|popup|modal|overlay|dialog|"
+    r"another|visible|display|showing|waiting|looking|searching|"
+    r"Dismiss|Accept|Cookie|Consent|Privacy|Terms|Policy|"
+    r"Welcome|Hello|Thanks|Thank|Please|Sorry|Error|Warning|Success|"
+    r"Download|Upload|Share|Follow|Like|Comment|Social|Email|"
+    r"Already|member|account|login|signup|register|password|username)$",
     re.I,
 )
 
@@ -53,11 +60,62 @@ def is_valid_step_code(code: Optional[str]) -> bool:
     return not _is_unit_like_or_decoy(code.strip())
 
 
+async def extract_code_from_code_section(page: Page) -> Optional[str]:
+    """
+    Look for code specifically in the 'Enter Code to Proceed' section.
+    The code might be displayed in a label, span, or data attribute near the input.
+    """
+    try:
+        # Find the code-entry section
+        code_section = await page.evaluate("""() => {
+            // Look for containers with "Enter Code" or "Proceed to Step" text
+            const containers = document.querySelectorAll('div, section, form');
+            for (const c of containers) {
+                const text = c.textContent || '';
+                if (/enter.*code.*proceed|proceed.*step|code.*proceed/i.test(text) &&
+                    c.querySelector('input')) {
+                    // Found the code section, look for codes
+                    // Check data attributes
+                    const dataCode = c.querySelector('[data-code], [data-step-code], [data-challenge-code]');
+                    if (dataCode) {
+                        const code = dataCode.getAttribute('data-code') ||
+                                    dataCode.getAttribute('data-step-code') ||
+                                    dataCode.getAttribute('data-challenge-code');
+                        if (code && /^[A-Za-z0-9_-]{6,12}$/.test(code)) return code;
+                    }
+                    // Check for code displayed in spans/labels near the input
+                    const spans = c.querySelectorAll('span, label, strong, b, code, .code');
+                    for (const s of spans) {
+                        const t = (s.textContent || '').trim();
+                        if (/^[A-Za-z0-9_-]{6,12}$/.test(t) && !/scroll|button|submit|enter|code/i.test(t)) {
+                            return t;
+                        }
+                    }
+                    // Check aria-label
+                    const ariaLabel = c.getAttribute('aria-label') || '';
+                    const match = ariaLabel.match(/[A-Za-z0-9_-]{6,12}/);
+                    if (match) return match[0];
+                }
+            }
+            return null;
+        }""")
+        if code_section and isinstance(code_section, str) and not _is_unit_like_or_decoy(code_section.strip()):
+            return code_section.strip()
+    except Exception:
+        pass
+    return None
+
+
 async def extract_codes_from_dom(page: Page) -> Optional[str]:
     """
     Look for code: click "click here 3 times" / reveal section first, then check data/aria, then body tokens.
     """
     try:
+        # First check the code-entry section specifically
+        code_from_section = await extract_code_from_code_section(page)
+        if code_from_section:
+            return code_from_section
+
         # "Hidden DOM Challenge ... click here 3 more times to reveal" – click that element 3 times
         try:
             click_here = page.get_by_text("click here", exact=False).first

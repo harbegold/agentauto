@@ -113,6 +113,7 @@ async def extract_code_from_code_section(page: Page) -> Optional[str]:
 async def extract_codes_from_dom(page: Page) -> Optional[str]:
     """
     Look for code: click "click here 3 times" / reveal section first, then check data/aria, then body tokens.
+    OPTIMIZED: Reduced waits, faster reveal clicks.
     """
     try:
         # First check the code-entry section specifically
@@ -120,15 +121,13 @@ async def extract_codes_from_dom(page: Page) -> Optional[str]:
         if code_from_section:
             return code_from_section
 
-        # "Hidden DOM Challenge ... click here 3 more times to reveal" – click that element 3 times
+        # "Hidden DOM Challenge ... click here 3 more times to reveal" – click fast
         try:
             click_here = page.get_by_text("click here", exact=False).first
             if await click_here.count() > 0:
                 for _ in range(3):
-                    await click_here.click(timeout=2000)
-                    await page.wait_for_timeout(200)
-                await page.wait_for_timeout(400)
-                # Code may appear in challenge section after 3 clicks; check data-* on any element and input
+                    await click_here.click(timeout=1000)
+                # Check data-* after clicks
                 code_after_reveal = await page.evaluate("""() => {
                     const walk = (el) => {
                         if (!el || el.nodeType !== 1) return null;
@@ -156,7 +155,7 @@ async def extract_codes_from_dom(page: Page) -> Optional[str]:
         except Exception:
             pass
 
-        # Click "Click to Reveal" / "reveal the code" section button
+        # Click reveal buttons - single attempt each
         for phrase in ["Click to Reveal", "reveal the code", "button to reveal", "Click the button"]:
             try:
                 container = page.locator("div, section, [class*='card'], [class*='box']").filter(
@@ -165,24 +164,21 @@ async def extract_codes_from_dom(page: Page) -> Optional[str]:
                 if await container.count() > 0:
                     btn = container.locator("button, a, [role='button']").first
                     if await btn.count() > 0:
-                        await btn.click(timeout=2000)
-                        await page.wait_for_timeout(300)
+                        await btn.click(timeout=1000)
                         break
             except Exception:
                 pass
 
-        # Click "Reveal Code" or similar if present
         for label in ["Reveal Code", "Reveal", "Show Code", "Get Code", "Code Revealed"]:
             btn = page.locator(f"button:has-text('{label}'), a:has-text('{label}'), [role=button]:has-text('{label}')").first
             if await btn.count() > 0:
                 try:
-                    await btn.click(timeout=2000)
-                    await page.wait_for_timeout(200)
+                    await btn.click(timeout=1000)
                 except Exception:
                     pass
                 break
 
-        # Hidden DOM: read from data-* and aria-* in challenge section
+        # Read from data-* and aria-*
         try:
             code_from_dom = await page.evaluate("""() => {
                 const sel = document.querySelector('[class*="challenge"], [class*="Challenge"], [data-code], [data-challenge]');
@@ -206,14 +202,13 @@ async def extract_codes_from_dom(page: Page) -> Optional[str]:
         except Exception:
             pass
 
-        # Pre-filled code input (e.g. after reveal)
+        # Pre-filled code input
         prefill = await extract_code_from_input_value(page)
         if prefill and 6 <= len(prefill) <= 64 and not _is_unit_like_or_decoy(prefill):
             return prefill
 
         body = await page.evaluate("() => document.body.innerText")
         tokens = CODE_TOKEN_PATTERN.findall(body)
-        # Prefer tokens that look like codes; reject unit-like (px, ms) and decoys
         for t in tokens:
             if 6 <= len(t) <= 12 and not _is_unit_like_or_decoy(t) and CODE_LIKE_PATTERN.match(t):
                 return t

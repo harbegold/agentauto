@@ -88,7 +88,8 @@ async def get_current_step(page: Page) -> Optional[int]:
 
 
 async def try_click_start(page: Page, log_debug: Optional[Callable[..., None]] = None) -> None:
-    """Click START once to enter the challenge from landing screen."""
+    """Click START once to enter the challenge from landing screen.
+    OPTIMIZED: Reduced wait after click."""
     log = log_debug or (lambda msg, *a, **k: None)
     for start_locator in [
         page.get_by_text("START", exact=True),
@@ -99,9 +100,9 @@ async def try_click_start(page: Page, log_debug: Optional[Callable[..., None]] =
     ]:
         try:
             if await start_locator.count() > 0:
-                await start_locator.click(timeout=5000)
-                await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                await page.wait_for_timeout(1200)
+                await start_locator.click(timeout=3000)
+                await page.wait_for_load_state("domcontentloaded", timeout=8000)
+                await page.wait_for_timeout(400)
                 log("Clicked START to enter challenge")
                 return
         except Exception as e:
@@ -113,15 +114,16 @@ async def wait_for_ready_state(
     get_current_step_fn: Optional[Callable] = None,
     log_debug: Optional[Callable[..., None]] = None,
 ) -> None:
-    """Wait until step number or code input is present."""
+    """Wait until step number or code input is present.
+    OPTIMIZED: Fewer iterations, shorter wait."""
     get_step = get_current_step_fn or get_current_step
-    for _ in range(15):
+    for _ in range(8):
         if await get_step(page) is not None:
             return
         inp_count = await page.evaluate("() => document.querySelectorAll('input:not([type=hidden])').length")
         if inp_count > 0:
             return
-        await page.wait_for_timeout(150)
+        await page.wait_for_timeout(50)
 
 
 async def _try_storage(
@@ -171,6 +173,7 @@ async def run_step(
     """
     Run one step: get code (parallel extraction, then pick by learned preference), fill and submit.
     Returns (ok, seconds, method, notes, code_used).
+    OPTIMIZED: Fast localStorage check first, minimal waits, parallel operations.
     """
     start = time.perf_counter()
     method = "dom"
@@ -178,39 +181,31 @@ async def run_step(
     cache = network_cache if network_cache is not None else {}
     code_used: Optional[str] = None
 
-    # 1) Close promotional popups first so Select Option modal is reachable
-    # Steps 4-5 have multiple nested popups (newsletter, Important Note, Select Option) - be more aggressive
-    popup_rounds = 3 if step in (4, 5) else (2 if step == 1 else 1)
-    await normalize_ui(page, rounds=popup_rounds)
-    await page.wait_for_timeout(50 if step in (4, 5) else (40 if step == 1 else 25))
+    # 0) ULTRA-FAST: Check localStorage immediately before any popup handling
+    # This is the fastest path when code is already stored
+    quick_code = await get_challenge_code_for_step_from_storage(page, step)
+    if quick_code and is_valid_step_code(quick_code):
+        code_used = quick_code
+        filled = await find_and_fill_code_input(page, quick_code)
+        elapsed = time.perf_counter() - start
+        if filled:
+            return True, elapsed, "localStorage", f"code_len={len(quick_code)}", quick_code
 
-    # 2) Handle "Please Select an Option" modal (scroll, pick correct option, Submit inside modal only)
-    await handle_select_option_modal(page)
-    await page.wait_for_timeout(25)
+    # 1) FAST: Single-pass popup + modal handling (no redundant rounds)
+    await normalize_ui(page, rounds=1)
+    modal_handled = await handle_select_option_modal(page)
 
-    # 3) Dismiss "Wrong Button!" if it appeared, then retry modal submit if still open
-    await normalize_ui(page, rounds=2 if step in (4, 5) else 1)
-    await page.wait_for_timeout(25)
-    await handle_select_option_modal(page)
-    await page.wait_for_timeout(25)
+    # Only do second round if modal was handled (may have revealed more popups)
+    if modal_handled:
+        await normalize_ui(page, rounds=1)
 
-    # 3b) For steps 4-5: extra popup clearing - these steps have multiple layered popups
-    if step in (4, 5):
-        await normalize_ui(page, rounds=2)
-        await page.wait_for_timeout(30)
-        # Try the select modal one more time in case it was hidden behind other popups
-        await handle_select_option_modal(page)
-        await page.wait_for_timeout(30)
-
-    # 4) Parallel extraction: storage (async), network (sync from cache), DOM (async)
-    # Skip normalize in _try_dom since we already did popup handling above
+    # 2) FAST: Parallel extraction - storage, network, DOM all at once
     storage_future = asyncio.create_task(_try_storage(page, step, storage_codes, use_fast_path))
     dom_future = asyncio.create_task(_try_dom(page, step, skip_normalize=True))
-    storage_result = await storage_future
-    dom_result = await dom_future
+    storage_result, dom_result = await asyncio.gather(storage_future, dom_future)
     network_result = _try_network_sync(step, cache)
 
-    # Pick first valid by learned preference; reject decoys (e.g. "Scroll") from any source
+    # Pick first valid by learned preference; reject decoys
     try_first = learned_method or "localStorage"
     order = (
         ["localStorage", "network", "dom"]
@@ -230,81 +225,44 @@ async def run_step(
             code = cand
             break
     if not code:
-        # Fallback: take any non-None result that passes decoy filter
         for result in (storage_result, network_result, dom_result):
             if result[0] and is_valid_step_code(result[0]):
                 code, method = result[0], result[1]
                 break
 
-    # 4b) Retry extraction if no code found - code may appear after modal interactions
+    # 3) FAST retry: Only if no code found - single quick retry pass
     if not code:
-        log_debug("Step %d: first extraction found no valid code, retrying after additional popup handling", step)
-        # Additional cleanup: ensure all popups are closed
-        # Steps 4-5 need extra aggressive popup clearing
-        retry_rounds = 3 if step in (4, 5) else 2
-        await normalize_ui(page, rounds=retry_rounds)
-        await page.wait_for_timeout(50)
+        log_debug("Step %d: no code found, quick retry", step)
+        # Quick popup clear + modal check
+        await normalize_ui(page, rounds=1)
+        await handle_select_option_modal(page)
 
-        # For steps 4-5: try handling the select modal again - the code might only appear after
-        if step in (4, 5):
-            await handle_select_option_modal(page)
-            await page.wait_for_timeout(30)
-            await normalize_ui(page, rounds=2)
-            await page.wait_for_timeout(30)
-
-        # Re-check localStorage directly for this step's key (may have been set by modal submit)
-        direct_storage_code = await get_challenge_code_for_step_from_storage(page, step)
-        if direct_storage_code and is_valid_step_code(direct_storage_code):
-            code = direct_storage_code
-            method = "localStorage"
-            log_debug("Step %d: retry found code in localStorage", step)
-        else:
-            # Try the code-entry section specifically
-            code_section_code = await extract_code_from_code_section(page)
-            if code_section_code and is_valid_step_code(code_section_code):
-                code = code_section_code
-                method = "dom"
-                log_debug("Step %d: retry found code in code-entry section", step)
-            else:
-                # Re-try DOM extraction with full normalization
-                retry_dom = await _try_dom(page, step, skip_normalize=False)
-                if retry_dom[0] and is_valid_step_code(retry_dom[0]):
-                    code = retry_dom[0]
-                    method = retry_dom[1]
-                    log_debug("Step %d: retry found code in DOM", step)
-                elif step in (4, 5):
-                    # Steps 4-5: final attempt - scroll page and extract again
-                    log_debug("Step %d: final extraction attempt after scroll", step)
-                    await scroll_to_bottom_and_back(page)
-                    await page.wait_for_timeout(100)
-                    final_code = await extract_codes_from_dom(page)
-                    if final_code and is_valid_step_code(final_code):
-                        code = final_code
-                        method = "dom"
-                        log_debug("Step %d: final attempt found code in DOM", step)
+        # Quick parallel re-extraction
+        direct_code, code_section, dom_retry = await asyncio.gather(
+            get_challenge_code_for_step_from_storage(page, step),
+            extract_code_from_code_section(page),
+            extract_codes_from_dom(page),
+        )
+        for cand in [direct_code, code_section, dom_retry]:
+            if cand and is_valid_step_code(cand):
+                code = cand
+                method = "localStorage" if cand == direct_code else "dom"
+                break
 
     if not code:
         elapsed = time.perf_counter() - start
         return False, elapsed, method, "no code found", None
     code_used = code
 
-    # 5) Select correct option if step requires it (e.g. radio "Option B - Correct Choice")
+    # 4) FAST: Select correct option (no waits after click)
     try:
         correct = page.locator('input[type="radio"]').filter(has_text="Correct").first
         if await correct.count() > 0:
-            await correct.click(timeout=2000)
-            await page.wait_for_timeout(50)
-    except Exception:
-        pass
-    try:
-        correct = page.locator('label:has-text("Correct"), input[value*="correct" i]').first
-        if await correct.count() > 0:
-            await correct.click(timeout=2000)
-            await page.wait_for_timeout(50)
+            await correct.click(timeout=1500)
     except Exception:
         pass
 
-    # 6) Fill code input and submit
+    # 5) Fill code input and submit
     filled = await find_and_fill_code_input(page, code)
     elapsed = time.perf_counter() - start
     if not filled:
@@ -325,14 +283,16 @@ async def solve_one_step(
 ) -> tuple[bool, float, str, str, Optional[str]]:
     """
     Solve one step with retries. Returns (ok, seconds, method, notes, code_used).
-    If learned_method is set, try that method first for getting the code.
+    OPTIMIZED: Reduced retries and inter-retry waits.
     """
     step_start = time.perf_counter()
     method = "dom"
     notes = ""
     last_code: Optional[str] = None
     cache = network_cache if network_cache is not None else {}
-    for attempt in range(max_retries):
+    # OPTIMIZED: Only 2 retries max for speed
+    actual_retries = min(max_retries, 2)
+    for attempt in range(actual_retries):
         if attempt > 0:
             await normalize_ui(page)
             if context is not None:
@@ -348,7 +308,6 @@ async def solve_one_step(
         )
         if ok:
             return True, elapsed, method, notes, code_used
-        await page.wait_for_timeout(200)
     return False, time.perf_counter() - step_start, method, notes, last_code
 
 
@@ -409,10 +368,10 @@ async def run_challenge(
     (out_dir / "traces").mkdir(parents=True, exist_ok=True)
 
     fast_mode = timeout_minutes <= 5
-    # ~2x speed: shorter waits so we can finish 30 steps in under 5 min
-    post_submit_wait_ms = 100 if fast_mode else 300
-    advance_poll_count = 20 if fast_mode else 50
-    advance_poll_ms = 50 if fast_mode else 150
+    # OPTIMIZED: Ultra-fast polling for <10s per step target
+    post_submit_wait_ms = 30 if fast_mode else 150
+    advance_poll_count = 10 if fast_mode else 30
+    advance_poll_ms = 20 if fast_mode else 100
 
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     step_results: list[StepResult] = []
@@ -463,11 +422,10 @@ async def run_challenge(
         try:
             log_debug("Navigating to %s", url)
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(600 if fast_mode else 1200)
+            await page.wait_for_timeout(300 if fast_mode else 800)
 
-            # Clear Cookie Consent and other overlays first (they block all clicks)
-            await normalize_ui(page, rounds=2)
-            await page.wait_for_timeout(100 if fast_mode else 200)
+            # Clear Cookie Consent and other overlays first
+            await normalize_ui(page, rounds=1)
 
             # Initial START if on landing
             current_after_load = await get_current_step(page)
@@ -625,7 +583,6 @@ async def run_challenge(
                         # Steps 1–5: retry once (reveal + extract + submit again) before failing
                         if solved_step in (1, 2, 3, 4, 5):
                             log_debug("Step %d: submit did not advance; retrying step %d once", solved_step, solved_step)
-                            await page.wait_for_timeout(250)
                             ok_retry, elapsed_retry, method_retry, notes_retry, code_retry = await solve_one_step(
                                 page, solved_step, storage_codes, use_fast_path, max_retries_per_step, context,
                                 learned_method=learned.get(solved_step),
